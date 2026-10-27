@@ -1,0 +1,730 @@
+--- ORIGINAL_index.html	2026-10-21 19:51:38.435473220 +0000
++++ visioindustria.html	2026-10-22 02:31:01.181227101 +0000
+@@ -72,7 +72,7 @@
+       <label>Pausa entre alertas iguais (s) <input type="range" id="cool" min="2" max="20" value="6"><span id="coolV">6</span></label>
+       <label>Modelo <select id="modelo"><option value="mobilenet_v2">Preciso (mais lento)</option><option value="lite_mobilenet_v2">Leve (mais rápido)</option></select></label>
+       <label>Lados (esquerda/direita) <select id="lados"><option value="auto">Automático</option><option value="normal">Normal (imagem = visão do usuário)</option><option value="invertido">Invertido (imagem espelhada)</option></select></label>
+-      <label>Modo de orientação <select id="modo"><option value="pista">Pista controlada (experimental)</option><option value="padrao">Padrão (exige passagem validada)</option></select></label>
++      <label>Modo de orientação <select id="modo"><option value="padrao">Padrão (exige passagem validada)</option><option value="pista">Pista controlada (experimental) — assume disponibilidade, sem comprovar</option></select></label>
+       <label>Avaliação de passagem (só no modo padrão) <select id="passagem"><option value="ligada">Ligada (heurística de piso, experimental)</option><option value="desligada">Desligada</option></select></label>
+       <label>Câmera <select id="camSel"><option value="">Padrão (traseira)</option></select></label>
+     </div>
+@@ -81,16 +81,20 @@
+       <div class="m"><span>Decisão</span><span id="oDec">–</span></div>
+       <div class="m"><span>Lados da imagem</span><span id="oLados">–</span></div>
+       <div class="m"><span>Passagem (piso por cor)</span><span id="oSeg">–</span></div>
++      <div class="m"><span>Fontes de dados</span><span id="oFontes">–</span></div>
++      <div class="m"><span>Regiões</span><span id="oReg">–</span></div>
+       <div class="m"><span>Motivos</span><span id="oMot">–</span></div>
+       <div class="m"><span>Limitações</span><span id="oLim">–</span></div>
+       <small>Regiões: esquerda, frente (centro) e direita, do ponto de vista do usuário. Segmentação semântica e profundidade: não implementadas.</small>
+     </div>
+     <div class="panel">
+       <strong>Métricas</strong>
++      <div class="m"><span>Estado da análise</span><span id="mEst">–</span></div>
+       <div class="m"><span>Modelo de detecção</span><span id="mModelo">não carregado</span></div>
+       <div class="m"><span>Backend do TensorFlow.js</span><span id="mBackend">–</span></div>
+       <div class="m"><span>Carga do modelo</span><span id="mCarga">–</span></div>
+       <div class="m"><span>Inferência COCO-SSD</span><span id="mInf">–</span></div>
++      <div class="m"><span>Segmentação (se registrada)</span><span id="mSeg">–</span></div>
+       <div class="m"><span>Ciclo total (inferência + alertas + desenho)</span><span id="mCic">–</span></div>
+       <div class="m"><span>FPS efetivo da análise</span><span id="mFps">–</span></div>
+       <div class="m"><span>FPS da câmera (quadros entregues)</span><span id="mCam">–</span></div>
+@@ -99,6 +103,7 @@
+       <div class="m"><span>Ciclos com erro</span><span id="mErr">0</span></div>
+       <div class="m"><span>Ciclos acima do intervalo</span><span id="mAtr">0</span></div>
+       <div class="m"><span>Resultados descartados (obsoletos)</span><span id="mDesc">0</span></div>
++      <div class="m"><span>Inferências expiradas (watchdog)</span><span id="mExp">0</span></div>
+       <div class="m"><span>Latência início da inferência → alerta</span><span id="mLat">–</span></div>
+       <div class="m"><span>Alertas emitidos</span><span id="mAl">0</span></div>
+       <div class="m"><span>Ciclos sem novo alerta (cena estável)</span><span id="mSup">0</span></div>
+@@ -189,7 +194,7 @@
+                                       : {facingMode:{ideal:'environment'}, width:{ideal:640}, height:{ideal:480}}};
+     stream = await navigator.mediaDevices.getUserMedia(c);
+     video.srcObject = stream; await video.play();
+-    stream.getVideoTracks()[0].addEventListener('ended', () => falha('A câmera foi desconectada.'));
++    stream.getVideoTracks()[0].addEventListener('ended', () => falha('A câmera foi desconectada.', 'camera_indisponivel'));
+     canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+     const trk = stream.getVideoTracks()[0]; facing = (trk.getSettings && trk.getSettings().facingMode) || '';
+     atualizarLados(); if (ladosAtual().motivo === 'câmera frontal detectada') log('Câmera frontal: lados invertidos automaticamente. Confira no seletor "Lados".');
+@@ -214,7 +219,7 @@
+         try{ model = await cocoSsd.load({base}); modeloAtual = base; modeloCargaMs = performance.now() - tc; modeloEstado = 'pronto'; }
+         catch(e){ model = null; modeloEstado = 'erro'; atualizarPainel(); throw e; }
+       } else modeloEstado = 'pronto';
+-      running = true; paused = false; perfRows.length = 0; tracks.clear(); ultimaAss = ''; ultimaUrg = ''; vazio = 0; avisouNenhum = false; candCiclos = 0; estabAlt.reset(); aquecimento = 0; ultimaEscolha = null; falhasSeguidas = 0; avisouFalha = false;
++      running = true; paused = false; perfRows.length = 0; limparEvidencias();
+       $('btnPausar').disabled = false; $('btnEncerrar').disabled = false; $('btnIniciar').textContent = 'Pausar / retomar';
+       $('btnIniciar').disabled = false;
+       status('Assistência ativa.'); falar('Assistência ativada. Os avisos não garantem caminho livre.', true);
+@@ -227,16 +232,19 @@
+     }
+   }
+   function pausar(){ paused = true; agendador.pausar(); ctx.clearRect(0,0,canvas.width,canvas.height); status('Assistência pausada.'); falar('Assistência pausada.', true); }
+-  function retomar(){ paused = false; status('Assistência ativa.'); falar('Assistência retomada.', true); agendador.retomar(); }
++  // Ao retomar, a cena pode ser outra: estabilização, alternativas e avisos de ANTES da pausa são evidência velha e não podem orientar nada.
++  function limparEvidencias(){ tracks.clear(); estabAlt.reset(); aquecimento = 0; ultimaEscolha = null; ultimaAss = ''; ultimaUrg = ''; vazio = 0; avisouNenhum = false; candCiclos = 0; falhasSeguidas = 0; avisouFalha = false; ultimoErroCodigo = ''; }
++  function retomar(){ paused = false; limparEvidencias(); status('Assistência ativa.'); falar('Assistência retomada.', true); agendador.retomar(); }
+   function encerrar(){
+     running = false; paused = false; agendador.parar(); pararPainel(); fecharCamera(); ctx.clearRect(0,0,canvas.width,canvas.height);
+     $('btnPausar').disabled = true; $('btnEncerrar').disabled = true; $('btnIniciar').textContent = 'Iniciar assistência';
+     status('Assistência encerrada.'); falar('Assistência encerrada.', true);
+   }
+-  function falha(msg){
++  function falha(msg, cod){
+     metrics.falhas++; $('mFa').textContent = metrics.falhas;
+     status('Falha: ' + msg);
+-    if (!avisouFalha){ avisouFalha = true; falar('Atenção: não foi possível avaliar a passagem. Pare e aguarde.', true); bipe(300, 400); log('FALHA — ' + msg); }
++    const camera = cod === 'camera_indisponivel' || cod === 'sem_quadros_novos';
++    if (!avisouFalha){ avisouFalha = true; falar(camera ? 'Atenção: a análise da câmera foi interrompida. Pare e aguarde.' : 'Atenção: não foi possível avaliar a passagem. Pare e aguarde.', true); bipe(300, 400); log('FALHA — ' + msg); }
+   }
+ 
+   // ---------- Detecção ----------
+@@ -259,19 +267,26 @@
+       return {n:a.length, ultimo:a[a.length-1], media:a.reduce((x, y) => x + y, 0) / a.length, p95:s[Math.max(0, Math.ceil(.95*s.length) - 1)]}; };
+     const seguro = (f, a) => { try { if (f) f(a); } catch (e) { /* um callback do app não pode derrubar o agendador */ } };
+     const ignorar = m => { st.ignorados++; st.motivos[m] = (st.motivos[m] || 0) + 1; };
++    // Cada falha carrega um CÓDIGO que separa causas diferentes: falha_inferencia, inferencia_expirada (watchdog), camera_indisponivel,
++    // sem_quadros_novos e falha_callback (erro no código do app que trata o resultado). A mensagem original é preservada.
++    const comCodigo = (e, c) => { if (e && typeof e === 'object' && !e.codigo) e.codigo = c; return e; };
++    const contar = e => { const c = (e && e.codigo) || 'falha_tarefa'; st.errosPorCodigo[c] = (st.errosPorCodigo[c] || 0) + 1; };
+     function zerar(){
+-      st = {concluidos:0, ignorados:0, erros:0, descartados:0, acimaIntervalo:0, motivos:{}}; cicloMs = []; fim = []; n = 0; ultimoCicloMs = 0;
++      st = {concluidos:0, ignorados:0, erros:0, descartados:0, acimaIntervalo:0, motivos:{}, errosPorCodigo:{}}; cicloMs = []; fim = []; n = 0; ultimoCicloMs = 0;
+       for (const t of tarefas) t.stat = {amostras:[], adiadas:0, indisponivel:0};
+     }
+     zerar();
+     function reagendar(g, ms){ if (g === gen && ativo && !pausado) timer = o.setTimer(() => ciclo(g), ms); }
+     function recomecar(){ const g = ++gen; o.clearTimer(timer); inicioJanela = now(); fim = []; semQuadroDesde = null; ciclo(g); }
+     // Inferência que nunca retorna: abandona o ciclo, conta erro, invalida a geração antiga e recomeça.
++    // Se o watchdog dispara com a assistência pausada ou encerrada, só libera o ciclo: nada para alarmar na sessão atual.
+     function abandonar(meu){
+       if (curso !== meu || !emCurso) return;
+-      emCurso = false; curso++; const g = ++gen;
+-      st.erros++; seguro(o.aoErro, new Error('Inferência travada: ciclo abandonado.'));
+-      if (ativo && !pausado) ciclo(g);
++      emCurso = false; curso++;
++      if (!ativo || pausado) return;
++      const g = ++gen, e = comCodigo(new Error('Inferência travada: ciclo abandonado.'), 'inferencia_expirada');
++      st.erros++; contar(e); seguro(o.aoErro, e);
++      ciclo(g);
+     }
+     async function ciclo(g){
+       if (g !== gen || !ativo || pausado) return;
+@@ -281,10 +296,10 @@
+       const wd = setW(() => abandonar(meu), WATCHDOG);
+       try{
+         const v = o.verificar ? o.verificar() : {};
+-        if (v.erro) throw new Error(v.erro);
++        if (v.erro) throw comCodigo(new Error(v.erro), v.codigo || 'camera_indisponivel');
+         if (v.ignorar){
+           if (semQuadroDesde === null) semQuadroDesde = t0;
+-          if (t0 - semQuadroDesde > STALL) throw new Error('Sem quadros novos da câmera.');
++          if (t0 - semQuadroDesde > STALL) throw comCodigo(new Error('Sem quadros novos da câmera.'), 'sem_quadros_novos');
+           ignorar(v.ignorar); resultado = 'ignorado'; espera = FOLGA_IGN; n--;
+         } else {
+           semQuadroDesde = null;
+@@ -292,15 +307,19 @@
+             if (t.cadaN > 1 && numero % t.cadaN !== 0) continue;
+             if (!t.pronto()){ t.stat.indisponivel++; continue; }
+             if (t.opcional && ultimoCicloMs > o.intervalo() * 1.5){ t.stat.adiadas++; continue; }
+-            const a = now(), r = await t.executar({ciclo:numero}), dt = now() - a;
++            const a = now(); let r; try { r = await t.executar({ciclo:numero}); } catch (e) { throw comCodigo(e, 'falha_inferencia'); } const dt = now() - a;
+             if (g !== gen){ st.descartados++; resultado = 'descartado'; break; }     // pausa/encerramento durante a inferência: resultado obsoleto
+             tempos[t.nome] = dt; ring(t.stat.amostras, dt); executou = true;
+-            if (t.aoConcluir) t.aoConcluir(r, {ciclo:numero, ms:dt});
++            if (t.aoConcluir){ try { t.aoConcluir(r, {ciclo:numero, ms:dt}); } catch (e) { throw comCodigo(e, 'falha_callback'); } }
+           }
+           if (resultado === 'ok' && !executou){ ignorar('nenhuma_tarefa_pronta'); resultado = 'ignorado'; espera = FOLGA_IGN; n--; }
+         }
+       }catch(e){
+-        if (curso === meu){ resultado = 'erro'; erro = e; st.erros++; seguro(o.aoErro, e); }
++        if (curso === meu){
++          // Falha de uma geração já encerrada (pausa/encerramento durante a inferência): é resultado obsoleto, não erro da sessão atual.
++          if (g !== gen){ st.descartados++; resultado = 'descartado'; }
++          else { resultado = 'erro'; erro = e; st.erros++; contar(e); seguro(o.aoErro, e); }
++        }
+       }finally{
+         clrW(wd);
+         if (curso !== meu) return;                          // ciclo já abandonado pelo watchdog: não mexe em mais nada
+@@ -308,7 +327,7 @@
+         const total = now() - t0;
+         if (resultado === 'ok'){ st.concluidos++; ring(cicloMs, total); ultimoCicloMs = total; ring(fim, now(), 400); if (total > o.intervalo()) st.acimaIntervalo++; }
+         else if (resultado === 'erro') ultimoCicloMs = total;
+-        if (resultado === 'ok' || resultado === 'erro') seguro(o.aoCiclo, {ciclo:numero, resultado, erro:erro && erro.message, tempos, totalMs:total});
++        if (resultado === 'ok' || resultado === 'erro') seguro(o.aoCiclo, {ciclo:numero, resultado, erro:erro && erro.message, codigo:erro && erro.codigo, tempos, totalMs:total});
+         reagendar(g, espera ?? Math.max(FOLGA, o.intervalo() - total));
+       }
+     }
+@@ -322,7 +341,7 @@
+       snapshot(t = now()){
+         const janela = Math.min(JAN, t - inicioJanela), c = fim.filter(x => x > t - JAN).length, por = {};
+         for (const x of tarefas) por[x.nome] = Object.assign({n:0}, resumo(x.stat.amostras), {adiadas:x.stat.adiadas, indisponivel:x.stat.indisponivel});
+-        return Object.assign({ativo, pausado, emCurso, fpsEfetivo:(ativo && !pausado && janela >= 1000) ? c / (janela/1000) : null, ciclo:resumo(cicloMs), tarefas:por}, st, {motivos:{...st.motivos}});
++        return Object.assign({ativo, pausado, emCurso, fpsEfetivo:(ativo && !pausado && janela >= 1000) ? c / (janela/1000) : null, ciclo:resumo(cicloMs), tarefas:por}, st, {motivos:{...st.motivos}, errosPorCodigo:{...st.errosPorCodigo}, expirados:st.errosPorCodigo.inferencia_expirada || 0});
+       }
+     };
+   }
+@@ -342,30 +361,49 @@
+   }
+ 
+   const perfRows = [];
++  const ESTADO_POR_CODIGO = {inferencia_expirada:'inferencia_expirada', camera_indisponivel:'camera_indisponivel', sem_quadros_novos:'camera_indisponivel'};
+   function registrarCiclo(r){
+-    perfRows.push([new Date().toISOString(), r.ciclo, r.resultado, r.erro || '', r.tempos['coco-ssd'] ?? '', r.totalMs, modeloAtual, camFps() ?? '']);
++    perfRows.push([new Date().toISOString(), r.ciclo, r.resultado, r.erro || '', r.tempos['coco-ssd'] ?? '', r.totalMs, modeloAtual, camFps() ?? '', r.codigo || '']);
+     if (perfRows.length > 3000) perfRows.shift();
+   }
+   const agendador = criarAgendador({
+     now: () => performance.now(), setTimer: (f, ms) => setTimeout(f, ms), clearTimer: t => clearTimeout(t),
+     intervalo: () => cfg().intervalo, verificar: verificarCamera, folgaMin: 30, folgaIgnorado: 20, stallMs: 2500, watchdogMs: 15000,
+-    aoErro: e => { estabAlt.reset(); aquecimento = 0; ultimaAss = ''; mostrarOrientacao(decidirOrientacao({modo: modoAtual(), deteccao:{estado:'falha', motivo:e.message}})); falhasSeguidas++; if (falhasSeguidas >= 3) falha(e.message || 'Erro de processamento.'); },
++    aoErro: e => {
++      const cod = (e && e.codigo) || 'falha_inferencia'; ultimoErroCodigo = cod; estabAlt.reset(); aquecimento = 0; ultimaAss = '';
++      mostrarOrientacao(decidirOrientacao({modo: modoAtual(), agora: performance.now(), deteccao:{estado: ESTADO_POR_CODIGO[cod] || 'falha', motivo: e && e.message}}));
++      falhasSeguidas++; if (falhasSeguidas >= 3) falha((e && e.message) || 'Erro de processamento.', cod);
++    },
+     aoCiclo: registrarCiclo
+   });
+   // Modelo de detecção. Um futuro SegmentationService entra com agendador.registrar({nome, prio, cadaN, opcional, pronto, executar, aoConcluir})
+   // e passa a rodar no mesmo ciclo, depois do COCO-SSD, sem concorrência.
++  // O resultado carrega o instante e o identificador do quadro, as dimensões DAQUELE quadro e (se a avaliação de piso estiver ligada) os pixels do MESMO
++  // instante, capturados antes de a inferência começar. Assim caixas e pixels descrevem a mesma cena (diferença de milissegundos entre drawImage e detect,
++  // ainda NÃO medida em aparelho). Antes, os pixels eram lidos depois da inferência, de um quadro mais novo que o das caixas.
++  let seqQuadro = 0, ultimoErroCodigo = '';
+   agendador.registrar({
+     nome:'coco-ssd', prio:10, pronto: () => model !== null && modeloEstado === 'pronto',
+-    executar: async () => { cam.ultimoAnalisado = cam.frames; const tCap = performance.now(); return {preds: await model.detect(video, 20, 0.3), tCap}; },
+-    aoConcluir: r => { falhasSeguidas = 0; avisouFalha = false; analisar(r.preds, r.tCap); desenhar(r.preds); }
++    executar: async () => {
++      cam.ultimoAnalisado = cam.frames;
++      const tCap = performance.now(), W = video.videoWidth, H = video.videoHeight, quadroId = cam.rvfc ? cam.frames : ++seqQuadro;
++      const img = (modoAtual() === 'padrao' && !segAtual && $('passagem').value === 'ligada') ? capturarQuadro() : undefined;
++      const preds = await model.detect(video, 20, 0.3);
++      return {preds, tCap, tConclusao: performance.now(), W, H, quadroId, img};
++    },
++    aoConcluir: r => { falhasSeguidas = 0; avisouFalha = false; ultimoErroCodigo = ''; analisar(r); desenhar(r.preds); }
+   });
+ 
+   // ---------- Painel de desempenho ----------
++  const ROTULO_ESTADO = {parado:'parado', pronto:'pronto', carregando_modelo:'carregando o modelo…', falha_carregamento:'falha ao carregar o modelo', analisando:'analisando', pausado:'pausado', camera_indisponivel:'câmera indisponível', inferencia_expirada:'inferência expirada', falha_na_analise:'falha na análise'};
+   const fms = v => v == null ? '–' : v.toFixed(v < 10 ? 1 : 0) + ' ms';
+   const fres = r => r ? fms(r.ultimo) + ' · méd ' + fms(r.media) + ' · p95 ' + fms(r.p95) : '–';
+   function atualizarPainel(){
+     const s = agendador.snapshot(performance.now()), c = s.tarefas['coco-ssd'] || {n:0};
+     $('mModelo').textContent = {nao_carregado:'não carregado', carregando:'carregando…', pronto:'pronto (' + modeloAtual + ')', erro:'erro ao carregar'}[modeloEstado];
++    $('mEst').textContent = ROTULO_ESTADO[estadoAnalise({modeloEstado, running, paused, emCurso:s.emCurso, ultimoErro:ultimoErroCodigo})];
++    $('mExp').textContent = s.expirados;
++    const sgm = s.tarefas['segmentacao']; $('mSeg').textContent = sgm && sgm.n ? fres(sgm) + (sgm.adiadas ? ' · adiada ' + sgm.adiadas + '×' : '') : (segReg ? 'registrado, sem medições' : 'nenhum segmentador registrado');
+     $('mBackend').textContent = (typeof tf !== 'undefined' && tf.getBackend && tf.getBackend()) || '–';
+     $('mCarga').textContent = modeloCargaMs ? (modeloCargaMs/1000).toFixed(1) + ' s' : '–';
+     $('mInf').textContent = c.n ? fres(c) : '–';
+@@ -380,11 +418,85 @@
+   function pararPainel(){ clearInterval(uiTimer); uiTimer = null; atualizarPainel(); }
+   $('btnPerf').onclick = () => {
+     const f = v => typeof v === 'number' ? v.toFixed(1).replace('.', ',') : '"' + String(v).replace(/"/g, '""') + '"';
+-    const csv = '\ufeffhora;ciclo;resultado;erro;inferencia_coco_ssd_ms;ciclo_total_ms;modelo_base;fps_camera\n' + perfRows.map(r => r.map(f).join(';')).join('\n');
++    const csv = '\ufeffhora;ciclo;resultado;erro;inferencia_coco_ssd_ms;ciclo_total_ms;modelo_base;fps_camera;codigo_erro\n' + perfRows.map(r => r.map(f).join(';')).join('\n');
+     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv'}));
+     a.download = 'visioindustria_desempenho.csv'; a.click(); URL.revokeObjectURL(a.href);
+   };
+ 
++  // ==== PERCEPCAO ====
++  // Contrato e validade temporal dos resultados das fontes de percepção (detecção, segmentação, profundidade).
++  // Funções PURAS: sem câmera, DOM, fala nem relógio global (o instante atual entra como argumento `agora`).
++  // Uma fonte entrega: {estado, origem, quadroId, tCaptura, tConclusao, completo, motivo, ...dados}
++  //   estado: 'ok' | 'carregando' | 'pronto' | 'analisando' | 'falha_carregamento' | 'inferencia_expirada' | 'camera_indisponivel'
++  //         | 'incompleto' | 'desatualizado' | 'incompativel' | 'indisponivel' | 'falha'
++  //   tCaptura: instante (ms, mesmo relógio da detecção) em que o QUADRO analisado foi capturado. Sem ele não há como saber se dois resultados
++  //             descrevem a mesma cena, então a fonte NÃO é combinada com a detecção (nunca se presume que sejam compatíveis).
++  //   quadroId: identificador do quadro de origem quando o navegador o fornece (contador do requestVideoFrameCallback); null = desconhecido.
++  // Idade = agora - tCaptura (ou idadeMs, se o chamador já a calculou). Idade DESCONHECIDA ou negativa nunca é tratada como "recente".
++  function idadeDe(f, agora){
++    if (!f) return null;
++    const i = Number.isFinite(f.idadeMs) ? f.idadeMs : (Number.isFinite(f.tCaptura) && Number.isFinite(agora) ? agora - f.tCaptura : null);
++    return i !== null && i >= 0 ? i : null;
++  }
++  // Duas fontes só podem ser combinadas se os quadros de origem foram capturados com diferença de no máximo maxMs.
++  function compativel(a, b, maxMs){
++    if (!a || !b || !Number.isFinite(a.tCaptura) || !Number.isFinite(b.tCaptura)) return {ok:false, motivo:'sem instante de captura em uma das fontes: compatibilidade temporal não verificável'};
++    const delta = Math.abs(a.tCaptura - b.tCaptura);
++    return delta <= maxMs ? {ok:true, deltaMs:delta} : {ok:false, deltaMs:delta, motivo:'quadros de origem diferentes demais (' + Math.round(delta) + ' ms; máximo ' + maxMs + ' ms)'};
++  }
++  // Porta de entrada de modelos EXTERNOS (segmentação, profundidade): exige estado 'ok' explícito, origem, instante de captura e resultado completo.
++  // O que faltar vira estado 'incompleto' com o motivo; falhas informadas pela própria fonte seguem como estão.
++  function validarFonteExterna(d){
++    if (!d || typeof d !== 'object') return {estado:'incompleto', motivo:'resultado inválido'};
++    if (d.estado !== 'ok') return Object.assign({}, d, {estado: d.estado || 'incompleto', motivo: d.motivo || 'fonte sem estado ok'});
++    if (d.completo === false) return Object.assign({}, d, {estado:'incompleto', motivo: d.motivo || 'resultado marcado como incompleto pela fonte'});
++    if (!d.origem) return Object.assign({}, d, {estado:'incompleto', motivo:'sem origem (modelo ou método) informada'});
++    if (!Number.isFinite(d.tCaptura)) return Object.assign({}, d, {estado:'incompleto', motivo:'sem instante de captura (tCaptura): não é possível verificar a compatibilidade com a detecção'});
++    return Object.assign({}, d);
++  }
++  // Os lados (esquerda/direita) só têm correspondência física confirmada se o usuário os escolheu ou se o navegador informou qual câmera é (frontal/traseira).
++  // Com seleção automática e câmera desconhecida o app apenas PRESUME câmera voltada para a frente: o centro vale, mas nenhuma alternativa lateral é indicada.
++  const ladosConfirmados = (sel, facing) => sel !== 'auto' || facing === 'user' || facing === 'environment';
++  // Estado único da análise para o painel (derivado; não decide nada).
++  function estadoAnalise({modeloEstado, running, paused, emCurso, ultimoErro}){
++    if (modeloEstado === 'carregando') return 'carregando_modelo';
++    if (modeloEstado === 'erro') return 'falha_carregamento';
++    if (!running) return modeloEstado === 'pronto' ? 'pronto' : 'parado';
++    if (paused) return 'pausado';
++    if (ultimoErro === 'camera_indisponivel' || ultimoErro === 'sem_quadros_novos') return 'camera_indisponivel';
++    if (ultimoErro === 'inferencia_expirada') return 'inferencia_expirada';
++    if (ultimoErro) return 'falha_na_analise';
++    return emCurso ? 'analisando' : 'pronto';
++  }
++  // Converte uma MÁSCARA de classes (um id por pixel, na orientação BRUTA da imagem) no formato `seg` que o motor de decisão já consome.
++  //   m = {mascara, w, h};  opc = {piso:[ids de chão transitável], ignorado:255, invertido, confianca, topo:.5, corridaMin:.6}
++  // Só as classes de `piso` contam como livres: parede, porta, escada, objetos e qualquer classe desconhecida contam como NÃO livres (conservador).
++  // Pixels `ignorado` também não são livres e reduzem `cobertura`. Mesma análise da heurística de cor (terços da imagem, metade inferior, corrida contínua a partir
++  // da base), mas SEM referência de cor: depende só do que o modelo classificou.
++  // `confianca` é uma CALIBRAÇÃO DE CAMPO informada por quem integra o modelo; a máscara não traz confiança por pixel. Sem ela (0) a decisão trata a região como
++  // "baixa confiança" (desconhecida): uma segmentação sem validação em campo nunca autoriza alternativa. Limitada a 0,9, como a heurística.
++  function regioesDeMascara(m, opc = {}){
++    const {mascara, w, h} = m || {}, piso = new Set(opc.piso || []), ign = opc.ignorado ?? 255, topo = opc.topo ?? .5, corrida = opc.corridaMin ?? .6;
++    if (!mascara || !(w > 0) || !(h > 0) || mascara.length < w*h) return {estado:'incompleto', motivo:'máscara inválida ou de tamanho diferente de w×h'};
++    if (!piso.size) return {estado:'incompleto', motivo:'nenhuma classe de piso informada'};
++    const y0 = Math.floor(h*topo), alt = h - y0;
++    if (!(alt >= 1)) return {estado:'incompleto', motivo:'região de análise vazia'};
++    let validos = 0; for (let y = y0; y < h; y++) for (let x = 0; x < w; x++) if (mascara[y*w + x] !== ign) validos++;
++    const conf = Math.max(0, Math.min(.9, Number.isFinite(opc.confianca) ? opc.confianca : 0)), bandas = ['esquerda','frente','direita'], regioes = {};
++    for (let b = 0; b < 3; b++){
++      const xa = Math.floor(b*w/3), xb = Math.floor((b+1)*w/3); let livres = 0, cel = 0; const boas = [];
++      for (let x = xa; x < xb; x++){
++        let run = 0; for (let y = h-1; y >= y0 && piso.has(mascara[y*w + x]); y--) run++;
++        for (let y = y0; y < h; y++){ if (piso.has(mascara[y*w + x])) livres++; cel++; }
++        boas.push(run/alt >= corrida);
++      }
++      let melhor = 0, atual = 0; for (const ok of boas){ atual = ok ? atual + 1 : 0; if (atual > melhor) melhor = atual; }
++      regioes[ladoUsuario(bandas[b], !!opc.invertido)] = {livre: livres/cel, continuidade: boas.filter(Boolean).length/boas.length, larguraRel: melhor/boas.length, confianca: conf};
++    }
++    return {estado:'ok', metodo:'mascara_de_classes', cobertura: validos/(w*alt), regioes};
++  }
++  // ==== FIM PERCEPCAO ====
++
+   // ==== PLANEJADOR ====
+   const ZTXT = {esquerda:'à esquerda', frente:'à frente', direita:'à direita'};
+   const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+@@ -461,19 +573,26 @@
+     return {estado:'ok', metodo:'heuristica_cor_piso', cobertura: uso, regioes, referencia:{rgb: m.map(Math.round), desvio: std, tolerancia: tol}};
+   }
+ 
+-  // ---- Decisão de orientação: 3 regiões (esquerda, frente = centro, direita) e as regras 1 a 8 ----
++  // ---- Decisão de orientação: 3 regiões (esquerda, frente = centro, direita) ----
+   // Região OBSTRUÍDA = há objeto reconhecido estável nela. Região com PASSAGEM VALIDADA = sem objeto, sem possível objeto de baixa confiança
+-  // e COM evidência positiva (livre, continuidade, largura, confiança, atualidade). Falta de caixas NÃO valida nada.
+-  // Entrada: {grupos, candidatos, deteccao, seg, prof, estab}
+-  //   grupos:     grupos estáveis [{cls, info, z, n, area}] (z já do ponto de vista do usuário)
+-  //   candidatos: detecções de baixa confiança, ainda não estáveis: [{z, area, nome}]
+-  //   deteccao:   {estado:'ok'|'falha'|'incompleto', motivo, idadeMs}
+-  //   seg:        {estado:'ok'|'falha'|'incompleto', cobertura:0..1, idadeMs, regioes:{esquerda|frente|direita:{livre, continuidade, larguraRel, confianca}}}
+-  //               produzido hoje por avaliarPassagemPorCor; uma segmentação semântica futura entra pelo mesmo formato (receberSegmentacao).
+-  //   prof:       (futuro, opcional) {estado:'ok', regioes:{...:{proximidade:0..1}}} profundidade RELATIVA, não metros. Só pode VETAR uma passagem.
+-  //   estab:      (opcional) criarEstabilizadorAlt(), histerese contra oscilação.
++  // e COM evidência positiva (livre, continuidade, largura, confiança, atualidade, compatibilidade com o quadro da detecção). Falta de caixas NÃO valida nada.
++  // O contrato completo de entrada e saída está documentado em decidirOrientacao, mais abaixo. Uma segmentação semântica futura entra pelo mesmo
++  // formato de `seg` (receberSegmentacao); profundidade relativa por `prof` (receberProfundidade).
+   const ZONAS = ['esquerda','frente','direita'];
+-  const LIM = {segCobMin:.6, segConfMin:.6, segLivreMin:.6, segContMin:.6, segLargMin:.5, segIdadeMaxMs:1500, deteccaoIdadeMaxMs:1500, profProxMax:.7, margemEscolha:.2, candAreaMin:.04, kOn:3, kOff:3};
++  // LIMITES PROVISÓRIOS: nenhum foi calibrado em aparelho real nem em cena industrial; não são valores universalmente seguros. São configuráveis
++  // (configurarLimites) e devem ser recalibrados com as medições do painel. Justificativa de partida:
++  //  - deteccaoIdadeMaxMs / segIdadeMaxMs / profIdadeMaxMs: idade máxima de um resultado; 1500 ms foi o valor herdado da etapa anterior (não medido).
++  //  - compatMaxMs: diferença máxima entre os instantes de captura de duas fontes. A heurística de piso usa o MESMO quadro da inferência (diferença ~0).
++  //    Um modelo futuro rodando em sequência captura DEPOIS do COCO-SSD, logo a diferença ≈ p95 da inferência medida no painel: se este limite for
++  //    menor que isso, a fonte nunca será compatível e a decisão ficará indeterminada (comportamento seguro, porém inútil). 300 ms é só ponto de partida.
++  const LIM = {segCobMin:.6, segConfMin:.6, segLivreMin:.6, segContMin:.6, segLargMin:.5, segIdadeMaxMs:1500, deteccaoIdadeMaxMs:1500, profIdadeMaxMs:1500, compatMaxMs:300, profProxMax:.7, margemEscolha:.2, candAreaMin:.04, kOn:3, kOff:3};
++  // Atualiza limites conhecidos (exceto kOn/kOff, que só valem ao criar um estabilizador). Tudo ou nada: um valor inválido rejeita a chamada inteira.
++  function configurarLimites(novos){
++    const ent = Object.entries(novos || {}), ruins = ent.filter(([k, v]) => !(k in LIM) || k === 'kOn' || k === 'kOff' || !Number.isFinite(v) || v < 0).map(([k]) => k);
++    if (!ent.length || ruins.length) return {aplicado:false, rejeitados: ruins, limites:{...LIM}};
++    for (const [k, v] of ent) LIM[k] = v;
++    return {aplicado:true, rejeitados:[], limites:{...LIM}};
++  }
+   const OPOSTO = {esquerda:'direita', direita:'esquerda'};
+   function criarEstabilizadorAlt(kOn = LIM.kOn, kOff = LIM.kOff){
+     const novo = () => ({on:false, a:0, b:0}), st = {esquerda:novo(), frente:novo(), direita:novo()};
+@@ -491,73 +610,133 @@
+       reset(){ for (const z of ZONAS) st[z] = novo(); }
+     };
+   }
+-  const segUsavel = sg => !!sg && sg.estado === 'ok' && sg.cobertura >= LIM.segCobMin && sg.idadeMs <= LIM.segIdadeMaxMs;
+-  function avaliarRegiao(z, e, ocupado, incerto){
+-    if (ocupado) return {valida:false, motivo:'há objeto reconhecido nessa região'};
+-    if (incerto) return {valida:false, motivo:'há possível objeto, de baixa confiança, nessa região'};
+-    const sg = e.seg;
+-    if (!sg) return {valida:false, motivo:'sem avaliação de passagem: falta de caixas não prova espaço livre'};
+-    if (sg.estado !== 'ok') return {valida:false, motivo:'avaliação de passagem ' + (sg.estado || 'indisponível') + (sg.motivo ? ' (' + sg.motivo + ')' : '')};
+-    if (!(sg.cobertura >= LIM.segCobMin)) return {valida:false, motivo:'avaliação de passagem incompleta'};
+-    if (!(sg.idadeMs <= LIM.segIdadeMaxMs)) return {valida:false, motivo:'dados de passagem desatualizados'};
+-    const r = sg.regioes && sg.regioes[z];
+-    if (!r || !(r.livre >= 0) || !(r.continuidade >= 0) || !(r.larguraRel >= 0)) return {valida:false, motivo:'sem dados da região'};
++  // Uma fonte de passagem/profundidade só é COMBINADA com a detecção atual se: estado ok, completa, idade conhecida e dentro do limite, e capturada
++  // num instante compatível com o da detecção. Senão a decisão que dependeria dela fica indeterminada (nunca vira evidência positiva) e o motivo é registrado.
++  function validarSeg(sg, det, agora){
++    if (!sg) return {usavel:false, estado:'indisponivel', motivo:'sem avaliação de passagem: falta de caixas não prova espaço livre'};
++    if (sg.estado !== 'ok') return {usavel:false, estado:sg.estado || 'indisponivel', motivo:'avaliação de passagem ' + (sg.estado || 'indisponível') + (sg.motivo ? ' (' + sg.motivo + ')' : '')};
++    if (!(sg.cobertura >= LIM.segCobMin)) return {usavel:false, estado:'incompleto', motivo:'avaliação de passagem incompleta'};
++    const idade = idadeDe(sg, agora);
++    if (idade === null) return {usavel:false, estado:'incompleto', motivo:'avaliação de passagem sem referência temporal (idade desconhecida)'};
++    if (!(idade <= LIM.segIdadeMaxMs)) return {usavel:false, estado:'desatualizado', idadeMs:idade, motivo:'dados de passagem desatualizados'};
++    const c = compativel(det, sg, LIM.compatMaxMs);
++    if (!c.ok) return {usavel:false, estado:'incompativel', idadeMs:idade, motivo:'passagem incompatível com a detecção: ' + c.motivo};
++    return {usavel:true, estado:'ok', idadeMs:idade, deltaMs:c.deltaMs};
++  }
++  // Profundidade relativa NUNCA é requisito: só pode VETAR uma passagem. Se estiver inválida, a decisão não depende dela, e isso fica em `limitacoes`.
++  function validarProf(pf, det, agora){
++    if (!pf) return {usavel:false, estado:'indisponivel'};
++    if (pf.estado !== 'ok') return {usavel:false, estado:pf.estado || 'indisponivel', motivo:'profundidade ' + (pf.estado || 'indisponível') + (pf.motivo ? ' (' + pf.motivo + ')' : '')};
++    const idade = idadeDe(pf, agora);
++    if (idade === null) return {usavel:false, estado:'incompleto', motivo:'profundidade sem referência temporal (idade desconhecida)'};
++    if (!(idade <= LIM.profIdadeMaxMs)) return {usavel:false, estado:'desatualizado', idadeMs:idade, motivo:'profundidade desatualizada'};
++    const c = compativel(det, pf, LIM.compatMaxMs);
++    if (!c.ok) return {usavel:false, estado:'incompativel', idadeMs:idade, motivo:'profundidade incompatível com a detecção: ' + c.motivo};
++    return {usavel:true, estado:'ok', idadeMs:idade, deltaMs:c.deltaMs};
++  }
++  // Estado de cada região (campo `estado` de evidencias.zonas e `regioes` da decisão):
++  //   'obstaculo'              objeto reconhecido, estável, na região;
++  //   'avaliada_favoravel'     há evidência suficiente e ela atende todos os critérios (ainda não é permissão: falta o estabilizador);
++  //   'avaliada_desfavoravel'  há evidência suficiente, mas ela NÃO atende (pouca área livre, sem continuidade, largura curta, veto da profundidade);
++  //   'desconhecida'           sem evidência suficiente (sem dados, desatualizados, incompatíveis, baixa confiança, possível objeto, lados não confirmados).
++  // Falta de caixas NUNCA leva a 'avaliada_favoravel'.
++  function avaliarRegiao(z, e, ocupado, incerto, vs, vp, ladosOk){
++    if (ocupado) return {estado:'obstaculo', valida:false, motivo:'há objeto reconhecido nessa região'};
++    if (incerto) return {estado:'desconhecida', valida:false, motivo: incerto === 'pendente' ? 'há detecção ainda não confirmada (persistência) nessa região' : 'há possível objeto, de baixa confiança, nessa região'};
++    if (z !== 'frente' && !ladosOk) return {estado:'desconhecida', valida:false, motivo:'orientação dos lados (esquerda/direita) não confirmada'};
++    if (!vs.usavel) return {estado:'desconhecida', valida:false, motivo:vs.motivo};
++    const r = e.seg.regioes && e.seg.regioes[z];
++    if (!r || !(r.livre >= 0) || !(r.continuidade >= 0) || !(r.larguraRel >= 0)) return {estado:'desconhecida', valida:false, motivo:'sem dados da região'};
+     const med = {livre:r.livre, continuidade:r.continuidade, larguraRel:r.larguraRel, confianca:r.confianca};
+-    if (!(r.confianca >= LIM.segConfMin)) return Object.assign({valida:false, motivo:'baixa confiança na avaliação'}, med);
+-    if (r.livre < LIM.segLivreMin) return Object.assign({valida:false, motivo:'pouca área livre na região'}, med);
+-    if (r.continuidade < LIM.segContMin) return Object.assign({valida:false, motivo:'sem continuidade visual da região'}, med);
+-    if (r.larguraRel < LIM.segLargMin) return Object.assign({valida:false, motivo:'largura contínua insuficiente'}, med);
+-    const pf = e.prof && e.prof.estado === 'ok' && e.prof.regioes && e.prof.regioes[z];
+-    if (pf && pf.proximidade > LIM.profProxMax) return Object.assign({valida:false, motivo:'estrutura próxima na profundidade relativa'}, med);
++    if (!(r.confianca >= LIM.segConfMin)) return Object.assign({estado:'desconhecida', valida:false, motivo:'baixa confiança na avaliação'}, med);
++    if (r.livre < LIM.segLivreMin) return Object.assign({estado:'avaliada_desfavoravel', valida:false, motivo:'pouca área livre na região'}, med);
++    if (r.continuidade < LIM.segContMin) return Object.assign({estado:'avaliada_desfavoravel', valida:false, motivo:'sem continuidade visual da região'}, med);
++    if (r.larguraRel < LIM.segLargMin) return Object.assign({estado:'avaliada_desfavoravel', valida:false, motivo:'largura contínua insuficiente'}, med);
++    const pf = vp.usavel && e.prof.regioes && e.prof.regioes[z];
++    if (pf && pf.proximidade > LIM.profProxMax) return Object.assign({estado:'avaliada_desfavoravel', valida:false, motivo:'estrutura próxima na profundidade relativa'}, med);
+     // critério objetivo de escolha entre passagens: largura × continuidade × confiança (todas relativas, sem metros)
+-    return Object.assign({valida:true, motivo:'área livre, contínua e larga o bastante na região', pontuacao: r.larguraRel*r.continuidade*r.confianca}, med);
++    return Object.assign({estado:'avaliada_favoravel', valida:true, motivo:'área livre, contínua e larga o bastante na região', pontuacao: r.larguraRel*r.continuidade*r.confianca}, med);
+   }
++  // decidirOrientacao(e) → decisão DETERMINÍSTICA (sem câmera, DOM, fala nem relógio global).
++  // Entrada: {grupos, candidatos, pendentes, deteccao, seg, prof, estab, modo, lados, agora, ultimaEscolha}
++  //   pendentes: [{z}] detecções confiantes deste ciclo que ainda não atingiram a persistência mínima. Não contam como obstáculo (não geram aviso), mas VETAM
++  //              alternativa naquela região (uma região com objeto aparecendo não é evidência de passagem) e não ativam a análise insuficiente.
++  //   deteccao: {estado, motivo, tCaptura, (idadeMs)}  agora: instante atual (mesmo relógio de tCaptura)  lados: {confirmado}
++  // Saída: {decisao, passagens, bloqueadas, obstaculos, motivos, limitacoes, evidencias,
++  //   permiteDirecao  true só se alguma alternativa pode ser mencionada (passagens não vazio); NUNCA significa passagem segura,
++  //   regioes         {esquerda|frente|direita: 'obstaculo'|'avaliada_favoravel'|'avaliada_desfavoravel'|'desconhecida'},
++  //   fontes          estado de cada fonte: {deteccao, segmentacao, profundidade, lados} (com idadeMs/motivo quando houver),
++  //   ausentes        informações ausentes ou inválidas que impediram uma conclusão}
++  // Decisões: obstaculo_esquerda|direita, possivel_passagem_esquerda|direita|centro, possiveis_passagens_esquerda_e_direita, passagem_nao_confirmada,
++  //   obstaculos_todas_direcoes, nenhum_objeto_reconhecido (nunca implica caminho livre), analise_insuficiente (dados faltando, inválidos ou antigos).
++  // Evidência ausente, expirada ou incompatível derruba qualquer alternativa NA HORA, inclusive a que o estabilizador vinha mantendo.
+   function decidirOrientacao(e){
+-    const grupos = e.grupos || [], cands = e.candidatos || [], det = e.deteccao || {estado:'ok'};
+-    const motivos = [], limitacoes = ['distancia_nao_medida', 'objetos_fora_do_modelo_nao_reconhecidos'];
+-    if (!e.seg) limitacoes.push('passagem_nao_avaliada_pelo_sistema'); else if (!segUsavel(e.seg)) limitacoes.push('passagem_nao_avaliada');
+-    if (!e.prof) limitacoes.push('profundidade_indisponivel');
++    const grupos = e.grupos || [], cands = e.candidatos || [], det = e.deteccao || {estado:'indisponivel', motivo:'sem informações da detecção'};
++    const motivos = [], limitacoes = ['distancia_nao_medida', 'objetos_fora_do_modelo_nao_reconhecidos'], ausentes = [];
++    const ladosOk = !e.lados || e.lados.confirmado !== false, pista = e.modo === 'pista';
++    const idadeDet = idadeDe(det, e.agora);
++    const detEstado = det.estado !== 'ok' ? (det.estado || 'indisponivel') : idadeDet === null ? 'incompleto' : idadeDet > LIM.deteccaoIdadeMaxMs ? 'desatualizado' : 'ok';
++    const vs = validarSeg(e.seg, det, e.agora), vp = e.prof ? validarProf(e.prof, det, e.agora) : {usavel:false, estado:'indisponivel'};
++    if (!e.seg) limitacoes.push('passagem_nao_avaliada_pelo_sistema'); else if (!vs.usavel) limitacoes.push('passagem_nao_avaliada');
++    if (!e.prof) limitacoes.push('profundidade_indisponivel'); else if (!vp.usavel) limitacoes.push('profundidade_descartada');
++    if (!ladosOk) limitacoes.push('orientacao_dos_lados_nao_confirmada');
++    if (!pista && !vs.usavel) ausentes.push('passagem: ' + vs.motivo);
++    if (e.prof && !vp.usavel) ausentes.push('profundidade: ' + (vp.motivo || vp.estado));
++    if (!ladosOk) ausentes.push('orientação dos lados (esquerda/direita) não confirmada');
++    const fontes = {deteccao:{estado:detEstado, idadeMs:idadeDet, motivo:det.motivo},
++      segmentacao: pista ? {estado:'nao_usada_no_modo_pista'} : {estado:vs.estado, idadeMs:vs.idadeMs, deltaMs:vs.deltaMs, motivo:vs.motivo, origem:e.seg && e.seg.origem},
++      profundidade:{estado:vp.estado, idadeMs:vp.idadeMs, motivo:vp.motivo}, lados:{confirmado:ladosOk}};
+     const obst = {esquerda:[], frente:[], direita:[]};
+     for (const g of grupos) obst[g.z].push({nome:g.info.s, n:g.n, area:g.area, prio:g.info.prio});
+     const evid = {objetos:grupos.length, candidatos:cands.length, zonas:{}, usouAvaliacaoDePassagem:false};
+-    if (e.modo === 'pista') evid.modo = 'pista_controlada';          // vale também para as falhas: o texto de parada depende do modo
+-    const fim = (decisao, passagens = [], bloqueadas = []) => ({decisao, bloqueadas, passagens, obstaculos:obst, motivos, limitacoes, evidencias:evid});
+-
+-    // Regra 8: falha, resultado incompleto ou dados da detecção velhos → não inventa direção.
+-    if (det.estado !== 'ok' || det.idadeMs > LIM.deteccaoIdadeMaxMs){
+-      const velho = det.estado === 'ok';
+-      motivos.push(velho ? 'dados da detecção desatualizados' : 'detecção ' + (det.estado === 'falha' ? 'falhou' : 'incompleta') + (det.motivo ? ': ' + det.motivo : ''));
+-      limitacoes.push(velho ? 'deteccao_desatualizada' : 'deteccao_' + det.estado); return fim('analise_insuficiente');
++    if (pista) evid.modo = 'pista_controlada';          // vale também para as falhas: o texto de parada depende do modo
++    // Sem detecção válida nenhuma região é conhecida: as marcas de obstáculo vêm de dados que não podem ser confiados.
++    const mapa = () => { const r = {}; for (const z of ZONAS) r[z] = detEstado !== 'ok' ? 'desconhecida' : obst[z].length ? 'obstaculo' : ((evid.zonas[z] && evid.zonas[z].estado) || 'desconhecida'); return r; };
++    const fim = (decisao, passagens = [], bloqueadas = []) => ({decisao, bloqueadas, passagens, obstaculos:obst, motivos, limitacoes, evidencias:evid,
++      permiteDirecao: passagens.length > 0, regioes: mapa(), fontes, ausentes});
++
++    // Falha, resultado incompleto, desatualizado, sem referência temporal ou fonte indisponível → não inventa direção e esquece alternativas anteriores.
++    if (detEstado !== 'ok'){
++      if (e.estab) e.estab.reset();
++      motivos.push(detEstado === 'desatualizado' ? 'dados da detecção desatualizados'
++        : idadeDet === null && det.estado === 'ok' ? 'detecção sem referência temporal (idade desconhecida)'
++        : 'detecção ' + (det.estado === 'falha' ? 'falhou' : det.estado === 'incompleto' ? 'incompleta' : 'indisponível (' + detEstado + ')') + (det.motivo ? ': ' + det.motivo : ''));
++      limitacoes.push(detEstado === 'desatualizado' ? 'deteccao_desatualizada' : idadeDet === null && det.estado === 'ok' ? 'deteccao_sem_referencia_temporal' : 'deteccao_' + detEstado);
++      ausentes.push('detecção: ' + detEstado);
++      return fim('analise_insuficiente');
+     }
+-    const inc = z => cands.some(c => c.z === z), bloq = ZONAS.filter(z => obst[z].length);
+-    if (e.modo === 'pista') return decidirPista(e, {obst, cands, bloq, motivos, limitacoes, evid, fim, inc});
++    const inc = z => cands.some(c => c.z === z), pend = z => (e.pendentes || []).some(x => x.z === z), bloq = ZONAS.filter(z => obst[z].length);
++    if (pista) return decidirPista(e, {obst, cands, bloq, motivos, limitacoes, evid, fim, inc, ladosOk});
+     const brutas = [];
+     for (const z of ZONAS){
+-      const av = avaliarRegiao(z, e, obst[z].length > 0, inc(z)); evid.zonas[z] = av;
++      const av = avaliarRegiao(z, e, obst[z].length > 0, inc(z) ? 'baixa' : pend(z) ? 'pendente' : false, vs, vp, ladosOk); evid.zonas[z] = av;
+       if (av.valida){ brutas.push(z); evid.usouAvaliacaoDePassagem = true; }
+     }
+-    const imediatos = ZONAS.filter(z => obst[z].length || inc(z));
++    // Cai na hora: zona com objeto/possível objeto, e TODAS as zonas se a evidência de passagem sumiu, expirou ou ficou incompatível (sem histerese).
++    const semEvidencia = z => !vs.usavel || (z !== 'frente' && !ladosOk);
++    const imediatos = ZONAS.filter(z => obst[z].length || inc(z) || pend(z) || semEvidencia(z));
+     const val = e.estab ? e.estab.filtrar(brutas, imediatos) : brutas;
+     for (const z of ZONAS) if (brutas.includes(z) && !val.includes(z)) evid.zonas[z].emEstabilizacao = true;
+     for (const z of bloq) motivos.push('obstáculo ' + ZTXT[z] + ': ' + obst[z].map(o => o.nome).join(', '));
+ 
+     if (!grupos.length){
+-      if (cands.length){                                                              // Regra 8: baixa confiança
++      if (cands.length){                                                              // baixa confiança
+         const zs = [...new Set(cands.map(c => c.z))];
+         motivos.push('possível objeto com baixa confiança ' + zs.map(z => ZTXT[z]).join(' e ')); limitacoes.push('baixa_confianca'); evid.zonasIncertas = zs;
+         return fim('analise_insuficiente');
+       }
++      // Cenário E: nenhum objeto reconhecido NÃO é evidência de passagem. Mesmo com avaliação de piso favorável não se indica direção nem "passagem".
+       motivos.push('nenhuma classe monitorada reconhecida'); limitacoes.push('ausencia_de_deteccao_nao_indica_caminho_livre');
+-      return fim('nenhum_objeto_reconhecido', val.filter(z => z === 'frente'));
++      return fim('nenhum_objeto_reconhecido');
+     }
+-    if (bloq.length === 3){ motivos.push('obstáculos em todas as regiões analisadas'); return fim('obstaculos_todas_direcoes', [], bloq); }   // Regra 5
+-    if (bloq.length === 2){                                                            // Regras 1, 2 e 3
++    if (bloq.length === 3){ motivos.push('obstáculos em todas as regiões analisadas'); return fim('obstaculos_todas_direcoes', [], bloq); }   // todas obstruídas
++    if (bloq.length === 2){                                                            // duas regiões obstruídas: só a restante, e só com evidência
+       const livre = ZONAS.find(z => !bloq.includes(z));
+       if (val.includes(livre)){ motivos.push('passagem validada ' + (livre === 'frente' ? 'pelo centro' : ZTXT[livre])); return fim('possivel_passagem_' + (livre === 'frente' ? 'centro' : livre), [livre], bloq); }
+       motivos.push('nenhuma região restante com passagem validada'); return fim('passagem_nao_confirmada', [], bloq);
+     }
+     const z = bloq[0];
+-    if (z === 'frente'){                                                               // Regras 4 e 6
++    if (z === 'frente'){                                                               // só o centro obstruído
+       const lados = val.filter(l => l !== 'frente');
+       if (lados.length === 2){
+         const pe = evid.zonas.esquerda.pontuacao, pd = evid.zonas.direita.pontuacao;
+@@ -570,27 +749,28 @@
+       if (lados.length === 1){ motivos.push('passagem validada à ' + lados[0]); return fim('possivel_passagem_' + lados[0], lados, bloq); }
+       motivos.push('frente obstruída e nenhuma lateral com passagem validada'); return fim('passagem_nao_confirmada', [], bloq);
+     }
+-    // Regra 7: obstáculo só em uma lateral. O lado oposto só é indicado com passagem validada, nunca por falta de detecção.
++    // Obstáculo só em uma lateral. O lado oposto só é indicado com passagem validada, nunca por falta de detecção.
+     const op = OPOSTO[z];
+     if (val.includes(op)){ motivos.push('passagem validada à ' + op); return fim('possivel_passagem_' + op, [op], bloq); }
+     motivos.push(op + ': ' + evid.zonas[op].motivo);
+     return fim('obstaculo_' + z, [], bloq);
+   }
+ 
+-  // ---- Modo PISTA CONTROLADA (EXPERIMENTAL) ----
++  // ---- Modo PISTA CONTROLADA (EXPERIMENTAL, opt-in) ----
+   // Premissa da DEMONSTRAÇÃO (não é capacidade da visão computacional): a pista é montada com 1 ou 2 passagens disponíveis em cada situação planejada.
+   // Por isso, aqui uma região conta como DISPONÍVEL quando NÃO tem obstáculo confirmado (estável) e NÃO tem possível objeto de baixa confiança.
+   // Isso é uma suposição da pista: a ausência de detecção NÃO prova que a região esteja livre ou segura, e o modelo não reconhece paletes, paredes etc.
++  // Por isso, no relatório de regiões essas regiões aparecem como 'desconhecida' (com assumidaDisponivelPelaPista), nunca como evidência.
+   // A heurística de cor do piso NÃO participa da decisão neste modo (não pode bloquear a orientação). Falhas, dados velhos e baixa confiança continuam
+   // gerando "análise insuficiente", nunca uma direção inventada. Se houver duas passagens, a escolha é consistente: mantém a anterior enquanto valer;
+-  // senão segue PRIORIDADE_PISTA (fixa), para não alternar esquerda/direita a cada análise.
++  // senão segue PRIORIDADE_PISTA (fixa), para não alternar esquerda/direita a cada análise. Lados não confirmados: nenhuma alternativa lateral.
+   const PRIORIDADE_PISTA = ['esquerda', 'direita'];
+   function decidirPista(e, c){
+-    const {obst, cands, bloq, motivos, limitacoes, evid, fim, inc} = c;
++    const {obst, cands, bloq, motivos, limitacoes, evid, fim, inc, ladosOk} = c;
+     limitacoes.push('pista_controlada_experimental', 'disponibilidade_assumida_pela_pista_nao_comprovada_pela_camera');
+     evid.modo = 'pista_controlada';
+-    const disp = z => !bloq.includes(z) && !inc(z);
+-    for (const z of ZONAS) evid.zonas[z] = {obstruida: bloq.includes(z), incerta: inc(z), disponivel: disp(z)};
++    const disp = z => !bloq.includes(z) && !inc(z) && (z === 'frente' || ladosOk);
++    for (const z of ZONAS) evid.zonas[z] = {estado: bloq.includes(z) ? 'obstaculo' : 'desconhecida', obstruida: bloq.includes(z), incerta: inc(z), disponivel: disp(z), assumidaDisponivelPelaPista: disp(z)};
+     for (const z of bloq) motivos.push('obstáculo ' + ZTXT[z] + ': ' + obst[z].map(o => o.nome).join(', '));
+     if (!bloq.length){
+       if (cands.length){
+@@ -606,7 +786,11 @@
+                  : bloq[0] === 'frente' ? ['esquerda', 'direita'].filter(disp)
+                  : [OPOSTO[bloq[0]]].filter(disp);
+     evid.opcoes = opcoes;
+-    if (!opcoes.length){ motivos.push('nenhuma região alternativa disponível (possível objeto de baixa confiança)'); limitacoes.push('baixa_confianca'); return fim('analise_insuficiente'); }
++    if (!opcoes.length){
++      motivos.push(ladosOk ? 'nenhuma região alternativa disponível (possível objeto de baixa confiança)' : 'orientação dos lados não confirmada: alternativas laterais não indicadas');
++      if (ladosOk) limitacoes.push('baixa_confianca');
++      return fim('analise_insuficiente');
++    }
+     let escolha = opcoes[0];
+     if (opcoes.length > 1){
+       const manteve = opcoes.includes(e.ultimaEscolha);
+@@ -627,7 +811,7 @@
+     naoAvaliada: 'Não foi possível avaliar a passagem adequadamente.',
+     pistaTodas: 'Pare. Obstáculos identificados em todas as direções.',
+     pistaInconclusiva: 'Não foi possível avaliar a passagem. Pare e aguarde.',
+-    pistaNenhum: 'Nenhum obstáculo reconhecido. Isso não indica caminho livre.'
++    nenhum: 'Nenhum obstáculo reconhecido nas classes monitoradas. Isso não indica caminho livre.'
+   };
+   const semPassagem = dec => dec.limitacoes.includes('passagem_nao_avaliada') ? MSG.naoAvaliada : MSG.naoConfirmada;
+   function cabecalho(B){
+@@ -645,7 +829,7 @@
+   // Texto da orientação. "texto" = completo (quando a situação muda); "curto" = só o obstáculo (repetições por tempo),
+   // para não martelar a mesma ressalva em todo alerta. Nunca afirma passagem livre.
+   function planejar(grupos, dec){
+-    dec = dec || decidirOrientacao({grupos});
++    dec = dec || decidirOrientacao({grupos, deteccao:{estado:'ok', idadeMs:0}});   // atalho para testes/ferramentas: o chamador afirma dados recém-capturados
+     if (dec.decisao === 'analise_insuficiente') return planejarSemObjetos(dec);   // dados incompletos: nada de direção nem de lista de objetos
+     if (dec.evidencias.modo === 'pista_controlada') return planejarPista(grupos, dec);
+     const rel = g => g.info.prio*10 + (g.z === 'frente' ? 15 : 0) + Math.min(g.area,.5)*20;
+@@ -680,9 +864,10 @@
+   // Decisões sem objetos estáveis: análise insuficiente ou nenhum objeto reconhecido. Nunca dizem "caminho livre".
+   function planejarSemObjetos(dec){
+     let t;
+-    if (dec.evidencias.modo === 'pista_controlada') t = dec.decisao === 'analise_insuficiente' ? MSG.pistaInconclusiva : MSG.pistaNenhum;
++    if (dec.evidencias.modo === 'pista_controlada') t = dec.decisao === 'analise_insuficiente' ? MSG.pistaInconclusiva : MSG.nenhum;
+     else if (dec.decisao === 'analise_insuficiente') t = MSG.naoAvaliada;
+-    else t = 'Nenhum obstáculo reconhecido. ' + (dec.passagens.includes('frente') ? 'Possível passagem pelo centro.' : semPassagem(dec));
++    else t = MSG.nenhum;                       // sem objetos: só informa o que o modelo não reconheceu; nunca direção nem "passagem"
++
+     return {texto:t, curto:t, ass:'#'+dec.decisao, urg:'', urgente:false};
+   }
+   // Estabilização por grupo (chave "nome falado|zona"), chamada uma vez por ciclo:
+@@ -708,7 +893,7 @@
+   // ==== FIM PLANEJADOR ====
+ 
+   // ---------- Orientação: estado, lados e avaliação de passagem ----------
+-  let ultimaEscolha = null, aquecimento = 0, facing = '', segAtual = null, profAtual = null, avisouNenhum = false, candCiclos = 0, ultimaDecisao = null, ultimaPassagem = null;
++  let ultimaEscolha = null, aquecimento = 0, facing = '', segAtual = null, segReg = null, profAtual = null, avisouNenhum = false, candCiclos = 0, ultimaDecisao = null, ultimaPassagem = null;
+   const estabAlt = criarEstabilizadorAlt();
+   const ladosAtual = () => resolverLados($('lados').value || 'auto', facing);
+   const modoAtual = () => $('modo').value === 'pista' ? 'pista' : 'padrao';
+@@ -716,23 +901,60 @@
+   function atualizarLados(){
+     const l = ladosAtual(), r = rotulosLados(l.invertido);
+     $('rotE').textContent = r[0]; $('rotD').textContent = r[1];
+-    $('oLados').textContent = (l.invertido ? 'invertidos' : 'normais') + ' (' + l.motivo + ')';
++    $('oLados').textContent = (l.invertido ? 'invertidos' : 'normais') + ' (' + l.motivo + ')' + (ladosConfirmados($('lados').value || 'auto', facing) ? '' : ' — NÃO confirmados: escolha "Normal" ou "Invertido" para liberar alternativas laterais');
+     tracks.clear(); estabAlt.reset(); aquecimento = 0; ultimaEscolha = null;
+   }
+   // Entrada para modelos externos (segmentação semântica e profundidade ainda NÃO implementadas). Se um deles fornecer dados, tem precedência
+   // sobre a heurística de cor do piso.
+-  const idade = x => x ? Object.assign({}, x, {idadeMs: performance.now() - x.recebidoEm}) : null;
+-  function receberSegmentacao(d){ segAtual = d ? Object.assign({}, d, {recebidoEm: performance.now()}) : null; }
+-  function receberProfundidade(d){ profAtual = d ? Object.assign({}, d, {recebidoEm: performance.now()}) : null; }
++  // Entrada validada (validarFonteExterna): exige estado 'ok', origem, tCaptura (mesmo relógio, performance.now()) e resultado completo. O que faltar vira
++  // 'incompleto' e a fonte NÃO é combinada com a detecção. A idade conta a partir da CAPTURA, não do recebimento. null remove a fonte.
++  function receberSegmentacao(d){ segAtual = d ? Object.assign({}, validarFonteExterna(d), {recebidoEm: performance.now()}) : null; }
++  function receberProfundidade(d){ profAtual = d ? Object.assign({}, validarFonteExterna(d), {recebidoEm: performance.now()}) : null; }
++  // Estado de cada fonte, sem fingir o que não existe: não há modelo de segmentação semântica nem de profundidade integrado.
++  function estadoFontes(){
++    const fx = (x, vazio) => x ? {estado:x.estado, origem:x.origem, motivo:x.motivo, tCaptura:x.tCaptura} : {estado:'indisponivel', motivo:vazio};
++    return {deteccao:{estado:modeloEstado, modelo:modeloAtual || null},
++      segmentacao: Object.assign(fx(segAtual, segReg ? 'segmentador registrado, ainda sem resultado' : 'nenhum modelo de segmentação semântica integrado'), {registrado: !!segReg}), profundidade: fx(profAtual, 'nenhum modelo de profundidade integrado'),
++      pisoPorCor:{estado: modoAtual() === 'padrao' && $('passagem').value === 'ligada' ? 'heuristica_experimental_ligada' : 'desligada_ou_nao_usada', metodo:'heuristica_cor_piso'}};
++  }
+   // Captura local de um quadro reduzido (64×48) só na memória, para a heurística de piso. Nada é salvo nem enviado.
+   const capC = document.createElement('canvas'); capC.width = 64; capC.height = 48;
+   const capX = capC.getContext ? capC.getContext('2d', {willReadFrequently:true}) : null;
+-  function capturarQuadro(){ capX.drawImage(video, 0, 0, 64, 48); const id = capX.getImageData(0, 0, 64, 48); return {data:id.data, w:64, h:48}; }
+-  function medirPassagem(preds, W, H, inv){
++  // Nunca lança: uma falha de captura não pode derrubar a inferência do ciclo; vira {erro} e a passagem fica 'falha' (indeterminada).
++  function capturarQuadro(){ try{ capX.drawImage(video, 0, 0, 64, 48); const id = capX.getImageData(0, 0, 64, 48); return {data:id.data, w:64, h:48}; }catch(err){ return {erro: err.message || 'falha na captura'}; } }
++  // Os pixels (img) são do MESMO instante tCap das caixas (ver tarefa 'coco-ssd'); W e H são as dimensões desse quadro.
++  function medirPassagem(preds, W, H, inv, img, tCap, quadroId){
++    const meta = {origem:'heuristica_cor_piso', tCaptura:tCap, quadroId};
++    if (!img || img.erro) return Object.assign({estado:'falha', motivo: (img && img.erro) || 'quadro não capturado'}, meta);
+     try{
+       const caixas = preds.filter(p => p.score >= .3).map(p => ({x:p.bbox[0]/W, y:p.bbox[1]/H, w:p.bbox[2]/W, h:p.bbox[3]/H}));   // qualquer objeto detectado invalida o piso sob ele
+-      return Object.assign(avaliarPassagemPorCor(capturarQuadro(), caixas, inv), {idadeMs:0});
+-    }catch(err){ return {estado:'falha', motivo:err.message, idadeMs:0}; }
++      return Object.assign(avaliarPassagemPorCor(img, caixas, inv), meta);
++    }catch(err){ return Object.assign({estado:'falha', motivo:err.message}, meta); }
++  }
++  // Ponto de integração de um segmentador (NENHUM é incluído nesta versão).
++  //   c = {origem, executar(video) → {mascara, w, h}, rotulos:{piso:[ids], ignorado?}, confianca, nome?, pronto?(), cadaN?, prio?, timeoutMs?}
++  // - Roda como tarefa OPCIONAL do agendador, por padrão ANTES do COCO-SSD no mesmo ciclo, para o instante de captura ficar próximo ao da detecção.
++  //   Com cadaN > 1 o resultado é reaproveitado nos ciclos seguintes e a verificação de compatibilidade o rejeita quando passa de LIM.compatMaxMs.
++  // - `confianca` é obrigatória: calibração de campo (ver regioesDeMascara). Sem validação em campo, use 0: a segmentação nunca autoriza alternativa.
++  // - Qualquer falha ou demora do segmentador vira resultado 'falha'/'inferencia_expirada' DELE; não derruba os alertas de obstáculo. Não há "fallback"
++  //   silencioso para a heurística de cor. timeoutMs (padrão 2000, PROVISÓRIO) não cancela a inferência: só deixa de esperá-la.
++  function registrarSegmentador(c){
++    if (segReg) throw new Error('já existe um segmentador registrado');
++    if (!c || typeof c.executar !== 'function' || !c.origem || !c.rotulos || !Array.isArray(c.rotulos.piso) || !c.rotulos.piso.length || !Number.isFinite(c.confianca))
++      throw new Error('segmentador inválido: exige executar, origem, rotulos.piso (ids) e confianca (calibração de campo; use 0 se não houver)');
++    segReg = {origem: c.origem, nome: c.nome || c.origem};
++    const tmo = c.timeoutMs > 0 ? c.timeoutMs : 2000;
++    agendador.registrar({nome:'segmentacao', prio: Number.isFinite(c.prio) ? c.prio : 5, cadaN: c.cadaN > 1 ? c.cadaN : 1, opcional:true, pronto: () => !c.pronto || !!c.pronto(),
++      executar: async () => {
++        const tCaptura = performance.now(), inv = ladosAtual().invertido; let tid;
++        try{
++          const m = await Promise.race([Promise.resolve(c.executar(video)), new Promise((_, rej) => { tid = setTimeout(() => rej(Object.assign(new Error('segmentação excedeu ' + tmo + ' ms'), {expirado:true})), tmo); })]);
++          return Object.assign(regioesDeMascara(m, {piso:c.rotulos.piso, ignorado:c.rotulos.ignorado, invertido:inv, confianca:c.confianca}), {origem:c.origem, tCaptura, tConclusao:performance.now()});
++        }catch(err){ return {estado: err && err.expirado ? 'inferencia_expirada' : 'falha', motivo: (err && err.message) || 'falha na segmentação', origem:c.origem, tCaptura}; }
++        finally{ clearTimeout(tid); }
++      },
++      aoConcluir: r => { segAtual = Object.assign(validarFonteExterna(r), {recebidoEm: performance.now()}); }
++    });
+   }
+   const pct = v => v == null ? '–' : Math.round(v*100) + '%';
+   function resumoPassagem(sg){
+@@ -744,9 +966,11 @@
+     ultimaDecisao = dec;
+     $('oDec').textContent = dec.decisao + (dec.evidencias.modo === 'pista_controlada' ? ' [pista experimental]' : '');
+     $('oMot').textContent = dec.motivos.join('; ') || '–'; $('oLim').textContent = dec.limitacoes.join('; ') || '–';
++    $('oFontes').textContent = 'detecção ' + dec.fontes.deteccao.estado + ' · passagem ' + dec.fontes.segmentacao.estado + ' · profundidade ' + dec.fontes.profundidade.estado;
++    $('oReg').textContent = ZONAS.map(z => z[0].toUpperCase() + ': ' + dec.regioes[z].replace(/_/g, ' ')).join(' · ');
+     $('oSeg').textContent = dec.evidencias.modo === 'pista_controlada' ? 'não usada no modo pista' : (segAtual || profAtual ? 'dados externos recebidos' : resumoPassagem(ultimaPassagem));
+   }
+-  window.VisioIndustria = {receberSegmentacao, receberProfundidade, decisaoAtual: () => ultimaDecisao};
++  window.VisioIndustria = {receberSegmentacao, receberProfundidade, registrarSegmentador, regioesDeMascara, estadoFontes, configurarLimites, decisaoAtual: () => ultimaDecisao};
+ 
+   let ultimaAss = '', ultimaUrg = '', ultimoFalado = 0, vazio = 0;
+   function falarOrientacao(plano, texto, urgente, agora, tCap, nomes, decisao){
+@@ -760,11 +984,15 @@
+     if (urgente) bipe(660, 100);
+     return true;
+   }
+-  function analisar(preds, tCap){
+-    const c = cfg(), agora = performance.now(), W = video.videoWidth, H = video.videoHeight, inv = ladosAtual().invertido, modo = modoAtual();
++  function analisar(r){
++    if (!running || paused) return;                                  // defesa em profundidade: o agendador já descarta gerações antigas
++    const {preds, tCap, W, H, quadroId, img} = r;                    // W/H são do quadro analisado, não do vídeo no momento do alerta
++    const c = cfg(), agora = performance.now(), inv = ladosAtual().invertido, modo = modoAtual();
++    const lados = {confirmado: ladosConfirmados($('lados').value || 'auto', facing)};
++    const meta = {origem:'coco-ssd', quadroId, tCaptura:tCap, tConclusao:r.tConclusao};
+     // Resultado incompleto do modelo ou vídeo sem dimensões: não orienta com dados incompletos.
+     if (!Array.isArray(preds) || !(W > 0) || !(H > 0)){
+-      estabAlt.reset(); ultimaPassagem = null; const dec = decidirOrientacao({modo, deteccao:{estado:'incompleto', motivo: !Array.isArray(preds) ? 'resultado do modelo inválido' : 'sem dimensões do vídeo'}});
++      estabAlt.reset(); ultimaPassagem = null; const dec = decidirOrientacao({modo, agora, lados, deteccao:Object.assign({estado:'incompleto', motivo: !Array.isArray(preds) ? 'resultado do modelo inválido' : 'sem dimensões do vídeo'}, meta)});
+       mostrarOrientacao(dec); const pl = planejarSemObjetos(dec);
+       if (pl.ass !== ultimaAss && agora - ultimoFalado >= 1500) falarOrientacao(pl, pl.texto, false, agora, tCap, 'análise incompleta', dec.decisao);
+       return;
+@@ -779,11 +1007,12 @@
+     }
+     aquecimento++;
+     const estaveis = atualizarTracks(tracks, grupos, c.persist);
++    const pendentes = [...grupos.values()].filter(g => !estaveis.some(t => t.info.s === g.info.s && t.z === g.z)).map(g => ({z:g.z, nome:g.info.s}));
+     candCiclos = candidatos.length ? candCiclos + 1 : 0;           // baixa confiança só conta se persistir (evita piscar)
+     let seg = null;                                                 // modo padrão: modelo externo (futuro) tem precedência; senão, a heurística de piso. No modo pista, não é usada.
+-    if (modo === 'padrao'){ seg = idade(segAtual); if (!seg && $('passagem').value === 'ligada') seg = medirPassagem(preds, W, H, inv); }
++    if (modo === 'padrao'){ seg = segAtual || (img !== undefined ? medirPassagem(preds, W, H, inv, img, tCap, quadroId) : null); }
+     ultimaPassagem = seg;
+-    const dec = decidirOrientacao({modo, ultimaEscolha, grupos: estaveis, candidatos: candCiclos >= c.persist ? candidatos : [], deteccao:{estado:'ok', idadeMs: performance.now() - tCap}, seg, prof: idade(profAtual), estab: estabAlt});
++    const dec = decidirOrientacao({modo, agora, lados, ultimaEscolha, grupos: estaveis, pendentes, candidatos: candCiclos >= c.persist ? candidatos : [], deteccao:Object.assign({estado:'ok'}, meta), seg, prof: profAtual, estab: estabAlt});
+     mostrarOrientacao(dec); if (dec.escolha) ultimaEscolha = dec.escolha;
+     if (estaveis.length || dec.decisao === 'analise_insuficiente') { vazio = 0; avisouNenhum = false; }
+     else {
+@@ -851,6 +1080,7 @@
+     if (e.code === 'Escape' && running) encerrar();
+   });
+   document.addEventListener('visibilitychange', () => { if (document.hidden && running && !paused) pausar(); });
++  video.addEventListener('resize', () => { if (video.videoWidth > 0 && video.videoHeight > 0){ canvas.width = video.videoWidth; canvas.height = video.videoHeight; } });   // rotação do aparelho
+   $('lados').addEventListener('change', atualizarLados); atualizarLados();
+   $('modo').addEventListener('change', atualizarModo); atualizarModo();
+   atualizarPainel();
